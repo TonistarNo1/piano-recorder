@@ -31,7 +31,7 @@ services:
       CREATE_AUDIO_MIX: "0"
       
       X264_PRESET: ultrafast
-      X264_CRF: "23"
+      X264_CRF: "22"
       ENCODER_PREFERENCE: libx264
 
       RETENTION_DAYS: "14"
