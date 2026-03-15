@@ -41,6 +41,13 @@ VIDEO_RTBUF_SIZE = os.getenv("VIDEO_RTBUF_SIZE", "512M")
 
 # Optional: Mix-Datei offline erzeugen (spart live Ressourcen)
 CREATE_AUDIO_MIX = os.getenv("CREATE_AUDIO_MIX", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Optional: Master-WAV live mitschreiben (kann bei manchen VM-Setups Knackser verstärken)
+RECORD_MASTER_WAV_LIVE = os.getenv("RECORD_MASTER_WAV_LIVE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 STOP_TIMEOUT_SECONDS = int(os.getenv("STOP_TIMEOUT_SECONDS", "20"))
 
@@ -227,7 +234,8 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
 
     video_encoder, video_encoder_args = select_video_encoder()
 
-    # Live nur 2 Outputs: mp4 + master.wav (keine Live-Splits -> stabilere PTS)
+    # Live standardmäßig nur mp4 (stabilster Pfad in VM-Umgebungen).
+    # master.wav/left/right/mix werden beim Stop offline erzeugt.
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -264,6 +272,8 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "0:v:0",
         "-map",
         "1:a:0",
+        "-af",
+        f"aresample={AUDIO_RATE}:async=1000:min_hard_comp=0.100:first_pts=0",
         "-c:v",
         video_encoder,
         *video_encoder_args,
@@ -284,16 +294,23 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "-movflags",
         "+faststart",
         str(video_path),
-        "-map",
-        "1:a:0",
-        "-c:a",
-        "pcm_s32le",
-        "-ar",
-        str(AUDIO_RATE),
-        "-ac",
-        "2",
-        str(master_wav_path),
     ]
+
+    # Optional: Live-Master zuschalten (nur wenn explizit gewünscht).
+    if RECORD_MASTER_WAV_LIVE:
+        command.extend(
+            [
+                "-map",
+                "1:a:0",
+                "-c:a",
+                "pcm_s32le",
+                "-ar",
+                str(AUDIO_RATE),
+                "-ac",
+                "2",
+                str(master_wav_path),
+            ]
+        )
 
     file_paths = {
         "video": str(video_path),
@@ -486,6 +503,7 @@ def finalize_recording_locked(final_status: str, return_code: Optional[int], rea
         "ffmpeg_return_code": return_code,
         "thumbnail_created": thumbnail_created,
         "create_audio_mix": CREATE_AUDIO_MIX,
+        "record_master_wav_live": RECORD_MASTER_WAV_LIVE,
         "audio_derivation": audio_derivation,
         "files": {
             "video": file_info(CURRENT_RECORDING["files"]["video"]),
