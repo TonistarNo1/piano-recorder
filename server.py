@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 """HTTP Recorder-Server für Video + Audio Capture auf externer SSD."""
 
@@ -21,13 +22,24 @@ RECORD_ROOT = Path(os.getenv("RECORD_ROOT", "/mnt/ssd/piano"))
 ARCHIVE_ROOT = Path(os.getenv("ARCHIVE_ROOT", "/mnt/ssd/archive"))
 STATE_ROOT = Path(os.getenv("STATE_ROOT", "/mnt/ssd/state"))
 LOG_ROOT = Path(os.getenv("LOG_ROOT", "/mnt/ssd/logs"))
+
 VIDEO_DEVICE = os.getenv("VIDEO_DEVICE", "/dev/video0")
-AUDIO_DEVICE = os.getenv("AUDIO_DEVICE", "plughw:1")
+AUDIO_DEVICE = os.getenv("AUDIO_DEVICE", "hw:1,0")  # kann via Compose auf plughw:1 gesetzt werden
+
 VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "1280"))
 VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "720"))
 VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
 AUDIO_RATE = int(os.getenv("AUDIO_RATE", "48000"))
-ENCODER_PREFERENCE = os.getenv("ENCODER_PREFERENCE", "qsv_auto")
+
+ENCODER_PREFERENCE = os.getenv("ENCODER_PREFERENCE", "libx264")
+X264_PRESET = os.getenv("X264_PRESET", "ultrafast")
+X264_CRF = os.getenv("X264_CRF", "23")
+
+VIDEO_THREAD_QUEUE_SIZE = int(os.getenv("VIDEO_THREAD_QUEUE_SIZE", "8192"))
+AUDIO_THREAD_QUEUE_SIZE = int(os.getenv("AUDIO_THREAD_QUEUE_SIZE", "16384"))
+AUDIO_ASYNC_SAMPLES = int(os.getenv("AUDIO_ASYNC_SAMPLES", "4000"))
+VIDEO_RTBUF_SIZE = os.getenv("VIDEO_RTBUF_SIZE", "512M")
+
 STOP_TIMEOUT_SECONDS = int(os.getenv("STOP_TIMEOUT_SECONDS", "20"))
 
 # Schritt 2: Globale Zustandsvariablen für laufende Aufnahme
@@ -115,7 +127,7 @@ def select_video_encoder() -> Tuple[str, list]:
             has_qsv_encoder,
         )
 
-    return "libx264", ["-preset", "veryfast", "-crf", "23", "-tune", "zerolatency"]
+    return "libx264", ["-preset", X264_PRESET, "-crf", X264_CRF, "-tune", "zerolatency"]
 
 
 def reserve_next_take_number() -> int:
@@ -149,7 +161,6 @@ def make_recording_dir(take_number: int, started_at: datetime) -> Path:
     candidate = base_dir
     suffix = 1
 
-    # Falls durch Clock/Retry doch eine Kollision entsteht, eindeutigen Suffix ergänzen.
     while candidate.exists():
         candidate = day_dir / f"{take_name}__retry_{suffix:02d}"
         suffix += 1
@@ -172,12 +183,12 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
     filter_complex = (
         f"[1:a]aresample={AUDIO_RATE}:async={AUDIO_ASYNC_SAMPLES}:min_hard_comp=0.100:first_pts=0,"
         f"aformat=sample_fmts=s32:sample_rates={AUDIO_RATE}:channel_layouts=stereo,"
-        "asetpts=N/SR/TB[a_clean];"
-        "[a_clean]asplit=4[a_mix_video_src][a_mix_wav_src][a_left_src][a_right_src];"
-        f"[a_mix_video_src]pan=stereo|c0={mix_expr}|c1={mix_expr}[a_mix_video];"
-        f"[a_mix_wav_src]pan=stereo|c0={mix_expr}|c1={mix_expr}[a_mix_wav];"
-        "[a_left_src]pan=mono|c0=c0[a_left];"
-        "[a_right_src]pan=mono|c0=c1[a_right]"
+        "asetpts=N/SR/TB[a0];"
+        "[a0]asplit=4[a1][a2][a3][a4];"
+        f"[a1]pan=stereo|c0={mix_expr}|c1={mix_expr},asetpts=N/SR/TB[a_mix_video];"
+        f"[a2]pan=stereo|c0={mix_expr}|c1={mix_expr},asetpts=N/SR/TB[a_mix_wav];"
+        "[a3]pan=mono|c0=c0,asetpts=N/SR/TB[a_left];"
+        "[a4]pan=mono|c0=c1,asetpts=N/SR/TB[a_right]"
     )
 
     video_encoder, video_encoder_args = select_video_encoder()
@@ -187,12 +198,17 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "-hide_banner",
         "-loglevel",
         "info",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
         "-y",
-        "-fflags", "+genpts",
         "-f",
         "v4l2",
+        "-rtbufsize",
+        VIDEO_RTBUF_SIZE,
         "-thread_queue_size",
-        "2048",
+        str(VIDEO_THREAD_QUEUE_SIZE),
         "-framerate",
         str(VIDEO_FPS),
         "-video_size",
@@ -202,7 +218,7 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "-f",
         "alsa",
         "-thread_queue_size",
-        "2048",
+        str(AUDIO_THREAD_QUEUE_SIZE),
         "-ac",
         "2",
         "-ar",
@@ -475,7 +491,6 @@ def start_recording():
         FFMPEG_PROCESS = process
         FFMPEG_LOG_HANDLE = ffmpeg_log_handle
 
-    # Kurzer Health-Check außerhalb des Locks, um Immediate-Fail früh zu erkennen.
     time.sleep(1.0)
 
     with STATE_LOCK:
@@ -519,13 +534,11 @@ def stop_recording():
 
         if process.poll() is None and process.stdin is not None:
             try:
-                # ffmpeg sauber stoppen: 'q' auf stdin
                 process.stdin.write("q\n")
                 process.stdin.flush()
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Graceful stop via stdin fehlgeschlagen: %s", exc)
 
-    # Warten außerhalb Lock, damit Status-Endpoint nicht komplett blockiert.
     try:
         process.wait(timeout=STOP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -581,3 +594,4 @@ def status():
 if __name__ == "__main__":
     LOGGER.info("Recorder-Server startet auf 0.0.0.0:5051")
     app.run(host="0.0.0.0", port=5051, debug=False, threaded=True)
+```
