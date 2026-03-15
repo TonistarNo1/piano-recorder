@@ -14,26 +14,25 @@ services:
       ARCHIVE_ROOT: /mnt/ssd/archive
       STATE_ROOT: /mnt/ssd/state
       LOG_ROOT: /mnt/ssd/logs
-
+    
       VIDEO_DEVICE: /dev/video0
-      AUDIO_DEVICE: hw:1,0
-
+      AUDIO_DEVICE: plughw:1
+    
       VIDEO_WIDTH: "1920"
       VIDEO_HEIGHT: "1080"
       VIDEO_FPS: "30"
       AUDIO_RATE: "48000"
-
+    
       VIDEO_THREAD_QUEUE_SIZE: "16384"
       AUDIO_THREAD_QUEUE_SIZE: "32768"
-      AUDIO_ASYNC_SAMPLES: "4000"
       VIDEO_RTBUF_SIZE: "512M"
-
+    
       CREATE_AUDIO_MIX: "0"
-      
+    
       X264_PRESET: ultrafast
       X264_CRF: "22"
       ENCODER_PREFERENCE: libx264
-
+    
       RETENTION_DAYS: "14"
     volumes:
       - /mnt/ssd:/mnt/ssd
