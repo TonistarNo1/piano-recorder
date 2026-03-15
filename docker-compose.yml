@@ -28,7 +28,7 @@ services:
       VIDEO_FPS: "30"
       AUDIO_RATE: "48000"
       RETENTION_DAYS: "14"
-      ENCODER_PREFERENCE: qsv_auto
+      ENCODER_PREFERENCE: libx264
 
     # Schritt 6: Externe SSD 1:1 in den Container mounten
     volumes:
