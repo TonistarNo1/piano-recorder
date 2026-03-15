@@ -1,0 +1,62 @@
+# Schritt 1: Stack-Namen festlegen
+name: piano-recorder
+
+services:
+  # Schritt 2: Flask Recorder-Service
+  recorder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: piano-recorder-server
+    restart: unless-stopped
+    ports:
+      - "5051:5051"
+    environment:
+      # Schritt 3: Alle Datenpfade explizit auf SSD legen
+      RECORD_ROOT: /mnt/ssd/piano
+      ARCHIVE_ROOT: /mnt/ssd/archive
+      STATE_ROOT: /mnt/ssd/state
+      LOG_ROOT: /mnt/ssd/logs
+
+      # Schritt 4: Capture-Quellen definieren
+      VIDEO_DEVICE: /dev/video0
+      AUDIO_DEVICE: plughw:1
+
+      # Schritt 5: Aufnahmeparameter setzen
+      VIDEO_WIDTH: "1280"
+      VIDEO_HEIGHT: "720"
+      VIDEO_FPS: "30"
+      AUDIO_RATE: "48000"
+      RETENTION_DAYS: "14"
+      ENCODER_PREFERENCE: qsv_auto
+
+    # Schritt 6: Externe SSD 1:1 in den Container mounten
+    volumes:
+      - /mnt/ssd:/mnt/ssd
+
+    # Schritt 7: Hardware-Geräte in den Container durchreichen
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/snd:/dev/snd
+      # Optional/empfohlen für Intel Quick Sync (wenn in VM durchgereicht)
+      - /dev/dri:/dev/dri
+
+    command: ["python", "/app/server.py"]
+
+  # Schritt 8: Täglicher Archivierungs-Worker
+  archiver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: piano-recorder-archiver
+    restart: unless-stopped
+    environment:
+      RECORD_ROOT: /mnt/ssd/piano
+      ARCHIVE_ROOT: /mnt/ssd/archive
+      STATE_ROOT: /mnt/ssd/state
+      LOG_ROOT: /mnt/ssd/logs
+      RETENTION_DAYS: "14"
+      ARCHIVE_CHECK_SECONDS: "86400"
+    volumes:
+      - /mnt/ssd:/mnt/ssd
+    command: ["python", "/app/archive_worker.py"]
