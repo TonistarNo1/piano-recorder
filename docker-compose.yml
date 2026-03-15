@@ -16,7 +16,7 @@ services:
       LOG_ROOT: /mnt/ssd/logs
 
       VIDEO_DEVICE: /dev/video0
-      AUDIO_DEVICE: plughw:1
+      AUDIO_DEVICE: plughw:1,0
 
       VIDEO_WIDTH: "1280"
       VIDEO_HEIGHT: "720"
@@ -24,8 +24,8 @@ services:
       AUDIO_RATE: "48000"
 
       VIDEO_THREAD_QUEUE_SIZE: "8192"
-      AUDIO_THREAD_QUEUE_SIZE: "8192"
-      AUDIO_ASYNC_SAMPLES: "1000"
+      AUDIO_THREAD_QUEUE_SIZE: "16384"
+      AUDIO_ASYNC_SAMPLES: "4000"
       VIDEO_RTBUF_SIZE: "256M"
 
       X264_PRESET: ultrafast
