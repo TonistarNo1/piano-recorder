@@ -24,7 +24,11 @@ STATE_ROOT = Path(os.getenv("STATE_ROOT", "/mnt/ssd/state"))
 LOG_ROOT = Path(os.getenv("LOG_ROOT", "/mnt/ssd/logs"))
 
 VIDEO_DEVICE = os.getenv("VIDEO_DEVICE", "/dev/video0")
+VIDEO_INPUT_FORMAT = os.getenv("VIDEO_INPUT_FORMAT", "mjpeg").strip().lower()
 AUDIO_DEVICE = os.getenv("AUDIO_DEVICE", "plughw:1")
+AUDIO_SOURCE_CHANNEL = os.getenv("AUDIO_SOURCE_CHANNEL", "both").strip().lower()
+if AUDIO_SOURCE_CHANNEL not in {"both", "left", "right"}:
+    AUDIO_SOURCE_CHANNEL = "both"
 
 VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "1920"))
 VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "1080"))
@@ -233,6 +237,27 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
     ffmpeg_log_path = recording_dir / "ffmpeg.log"
 
     video_encoder, video_encoder_args = select_video_encoder()
+    audio_resample = f"aresample={AUDIO_RATE}:async=1000:min_hard_comp=0.100:first_pts=0"
+
+    if AUDIO_SOURCE_CHANNEL == "left":
+        audio_base = f"pan=mono|c0=c0,{audio_resample}"
+        audio_channels = "1"
+    elif AUDIO_SOURCE_CHANNEL == "right":
+        audio_base = f"pan=mono|c0=c1,{audio_resample}"
+        audio_channels = "1"
+    else:
+        audio_base = audio_resample
+        audio_channels = "2"
+
+    if RECORD_MASTER_WAV_LIVE:
+        filter_complex = f"[1:a]{audio_base}[a_pre];[a_pre]asplit=2[a_out][a_master]"
+    else:
+        filter_complex = f"[1:a]{audio_base}[a_out]"
+
+    # Video-Input-Format optional setzen (mjpeg reduziert USB-Last gegenüber rawvideo).
+    video_input_args = []
+    if VIDEO_INPUT_FORMAT:
+        video_input_args = ["-input_format", VIDEO_INPUT_FORMAT]
 
     # Live standardmäßig nur mp4 (stabilster Pfad in VM-Umgebungen).
     # master.wav/left/right/mix werden beim Stop offline erzeugt.
@@ -252,6 +277,7 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         VIDEO_RTBUF_SIZE,
         "-thread_queue_size",
         str(VIDEO_THREAD_QUEUE_SIZE),
+        *video_input_args,
         "-framerate",
         str(VIDEO_FPS),
         "-video_size",
@@ -268,12 +294,12 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         str(AUDIO_RATE),
         "-i",
         AUDIO_DEVICE,
+        "-filter_complex",
+        filter_complex,
         "-map",
         "0:v:0",
         "-map",
-        "1:a:0",
-        "-af",
-        f"aresample={AUDIO_RATE}:async=1000:min_hard_comp=0.100:first_pts=0",
+        "[a_out]",
         "-c:v",
         video_encoder,
         *video_encoder_args,
@@ -290,7 +316,7 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "-ar",
         str(AUDIO_RATE),
         "-ac",
-        "2",
+        audio_channels,
         "-movflags",
         "+faststart",
         str(video_path),
@@ -301,13 +327,13 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         command.extend(
             [
                 "-map",
-                "1:a:0",
+                "[a_master]",
                 "-c:a",
                 "pcm_s32le",
                 "-ar",
                 str(AUDIO_RATE),
                 "-ac",
-                "2",
+                audio_channels,
                 str(master_wav_path),
             ]
         )
@@ -384,11 +410,19 @@ def generate_audio_derivatives(files: Dict[str, str]) -> Dict[str, object]:
         "master": ensure_master_wav(video_path, master_wav),
         "left": {"ok": False},
         "right": {"ok": False},
-        "mix": {"ok": False, "skipped": not CREATE_AUDIO_MIX},
+        "mix": {"ok": False, "skipped": (not CREATE_AUDIO_MIX) or AUDIO_SOURCE_CHANNEL != "both"},
     }
 
     if not results["master"].get("ok", False):
         return results
+
+    # Bei Single-Channel-Aufnahme denselben Kanal auf left/right schreiben.
+    if AUDIO_SOURCE_CHANNEL == "both":
+        left_pan = "pan=mono|c0=c0"
+        right_pan = "pan=mono|c0=c1"
+    else:
+        left_pan = "pan=mono|c0=c0"
+        right_pan = "pan=mono|c0=c0"
 
     results["left"] = run_ffmpeg_task(
         [
@@ -400,7 +434,7 @@ def generate_audio_derivatives(files: Dict[str, str]) -> Dict[str, object]:
             "-i",
             master_wav,
             "-filter:a",
-            "pan=mono|c0=c0",
+            left_pan,
             "-c:a",
             "pcm_s32le",
             "-ar",
@@ -422,7 +456,7 @@ def generate_audio_derivatives(files: Dict[str, str]) -> Dict[str, object]:
             "-i",
             master_wav,
             "-filter:a",
-            "pan=mono|c0=c1",
+            right_pan,
             "-c:a",
             "pcm_s32le",
             "-ar",
@@ -434,7 +468,7 @@ def generate_audio_derivatives(files: Dict[str, str]) -> Dict[str, object]:
         "render_right",
     )
 
-    if CREATE_AUDIO_MIX:
+    if CREATE_AUDIO_MIX and AUDIO_SOURCE_CHANNEL == "both":
         mix_expr = "0.5*c0+0.5*c1"
         results["mix"] = run_ffmpeg_task(
             [
@@ -503,6 +537,8 @@ def finalize_recording_locked(final_status: str, return_code: Optional[int], rea
         "ffmpeg_return_code": return_code,
         "thumbnail_created": thumbnail_created,
         "create_audio_mix": CREATE_AUDIO_MIX,
+        "audio_source_channel": AUDIO_SOURCE_CHANNEL,
+        "video_input_format": VIDEO_INPUT_FORMAT,
         "record_master_wav_live": RECORD_MASTER_WAV_LIVE,
         "audio_derivation": audio_derivation,
         "files": {
