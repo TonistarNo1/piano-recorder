@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """HTTP Recorder-Server für Video + Audio Capture auf externer SSD."""
 
@@ -17,6 +16,7 @@ from typing import Dict, Optional, Tuple
 
 from flask import Flask, jsonify
 
+
 # Schritt 1: Konfiguration über Environment-Variablen laden
 RECORD_ROOT = Path(os.getenv("RECORD_ROOT", "/mnt/ssd/piano"))
 ARCHIVE_ROOT = Path(os.getenv("ARCHIVE_ROOT", "/mnt/ssd/archive"))
@@ -24,21 +24,23 @@ STATE_ROOT = Path(os.getenv("STATE_ROOT", "/mnt/ssd/state"))
 LOG_ROOT = Path(os.getenv("LOG_ROOT", "/mnt/ssd/logs"))
 
 VIDEO_DEVICE = os.getenv("VIDEO_DEVICE", "/dev/video0")
-AUDIO_DEVICE = os.getenv("AUDIO_DEVICE", "hw:1,0")  # kann via Compose auf plughw:1 gesetzt werden
+AUDIO_DEVICE = os.getenv("AUDIO_DEVICE", "plughw:1")
 
-VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "1280"))
-VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "720"))
+VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "1920"))
+VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "1080"))
 VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
 AUDIO_RATE = int(os.getenv("AUDIO_RATE", "48000"))
 
 ENCODER_PREFERENCE = os.getenv("ENCODER_PREFERENCE", "libx264")
 X264_PRESET = os.getenv("X264_PRESET", "ultrafast")
-X264_CRF = os.getenv("X264_CRF", "23")
+X264_CRF = os.getenv("X264_CRF", "22")
 
-VIDEO_THREAD_QUEUE_SIZE = int(os.getenv("VIDEO_THREAD_QUEUE_SIZE", "8192"))
-AUDIO_THREAD_QUEUE_SIZE = int(os.getenv("AUDIO_THREAD_QUEUE_SIZE", "16384"))
-AUDIO_ASYNC_SAMPLES = int(os.getenv("AUDIO_ASYNC_SAMPLES", "4000"))
+VIDEO_THREAD_QUEUE_SIZE = int(os.getenv("VIDEO_THREAD_QUEUE_SIZE", "16384"))
+AUDIO_THREAD_QUEUE_SIZE = int(os.getenv("AUDIO_THREAD_QUEUE_SIZE", "32768"))
 VIDEO_RTBUF_SIZE = os.getenv("VIDEO_RTBUF_SIZE", "512M")
+
+# Optional: Mix-Datei offline erzeugen (spart live Ressourcen)
+CREATE_AUDIO_MIX = os.getenv("CREATE_AUDIO_MIX", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 STOP_TIMEOUT_SECONDS = int(os.getenv("STOP_TIMEOUT_SECONDS", "20"))
 
@@ -169,9 +171,53 @@ def make_recording_dir(take_number: int, started_at: datetime) -> Path:
     return candidate
 
 
+def run_ffmpeg_task(args: list, task_name: str) -> Dict[str, object]:
+    """Hilfsfunktion für Offline-ffmpeg-Aufgaben mit Logging."""
+    LOGGER.info("Offline ffmpeg (%s): %s", task_name, " ".join(args))
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+
+    if result.returncode != 0:
+        LOGGER.error("Offline ffmpeg (%s) fehlgeschlagen: %s", task_name, (result.stderr or "").strip())
+        return {"ok": False, "return_code": result.returncode, "stderr": (result.stderr or "").strip()}
+
+    return {"ok": True, "return_code": result.returncode}
+
+
+def ensure_master_wav(video_path: str, master_wav_path: str) -> Dict[str, object]:
+    """Stellt sicher, dass eine unkomprimierte Stereo-Masterdatei existiert."""
+    if Path(master_wav_path).exists():
+        return {"ok": True, "source": "live_recording"}
+
+    # Fallback: aus MP4-Audiospur extrahieren (falls live master.wav fehlt)
+    result = run_ffmpeg_task(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            video_path,
+            "-vn",
+            "-c:a",
+            "pcm_s32le",
+            "-ar",
+            str(AUDIO_RATE),
+            "-ac",
+            "2",
+            master_wav_path,
+        ],
+        "extract_master_wav",
+    )
+
+    result["source"] = "extracted_from_mp4"
+    return result
+
+
 def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str]:
-    """Schritt 8: ffmpeg-Kommando für Video + Mix + Left/Right bauen."""
+    """Schritt 8: Stabiles Live-Recording ohne Live-Audiosplitting bauen."""
     video_path = recording_dir / "video.mp4"
+    master_wav_path = recording_dir / "master.wav"
     audio_mix_path = recording_dir / "audio_mix.wav"
     left_path = recording_dir / "left.wav"
     right_path = recording_dir / "right.wav"
@@ -179,20 +225,9 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
     metadata_path = recording_dir / "metadata.json"
     ffmpeg_log_path = recording_dir / "ffmpeg.log"
 
-    mix_expr = "0.5*c0+0.5*c1"
-    filter_complex = (
-        f"[1:a]aresample={AUDIO_RATE}:async={AUDIO_ASYNC_SAMPLES}:min_hard_comp=0.100:first_pts=0,"
-        f"aformat=sample_fmts=s32:sample_rates={AUDIO_RATE}:channel_layouts=stereo,"
-        "asetpts=N/SR/TB[a0];"
-        "[a0]asplit=4[a1][a2][a3][a4];"
-        f"[a1]pan=stereo|c0={mix_expr}|c1={mix_expr},asetpts=N/SR/TB[a_mix_video];"
-        f"[a2]pan=stereo|c0={mix_expr}|c1={mix_expr},asetpts=N/SR/TB[a_mix_wav];"
-        "[a3]pan=mono|c0=c0,asetpts=N/SR/TB[a_left];"
-        "[a4]pan=mono|c0=c1,asetpts=N/SR/TB[a_right]"
-    )
-
     video_encoder, video_encoder_args = select_video_encoder()
 
+    # Live nur 2 Outputs: mp4 + master.wav (keine Live-Splits -> stabilere PTS)
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -225,12 +260,10 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         str(AUDIO_RATE),
         "-i",
         AUDIO_DEVICE,
-        "-filter_complex",
-        filter_complex,
         "-map",
         "0:v:0",
         "-map",
-        "[a_mix_video]",
+        "1:a:0",
         "-c:v",
         video_encoder,
         *video_encoder_args,
@@ -243,7 +276,7 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        "256k",
         "-ar",
         str(AUDIO_RATE),
         "-ac",
@@ -252,36 +285,19 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "+faststart",
         str(video_path),
         "-map",
-        "[a_mix_wav]",
+        "1:a:0",
         "-c:a",
         "pcm_s32le",
         "-ar",
         str(AUDIO_RATE),
         "-ac",
         "2",
-        str(audio_mix_path),
-        "-map",
-        "[a_left]",
-        "-c:a",
-        "pcm_s32le",
-        "-ar",
-        str(AUDIO_RATE),
-        "-ac",
-        "1",
-        str(left_path),
-        "-map",
-        "[a_right]",
-        "-c:a",
-        "pcm_s32le",
-        "-ar",
-        str(AUDIO_RATE),
-        "-ac",
-        "1",
-        str(right_path),
+        str(master_wav_path),
     ]
 
     file_paths = {
         "video": str(video_path),
+        "master_wav": str(master_wav_path),
         "audio_mix": str(audio_mix_path),
         "left": str(left_path),
         "right": str(right_path),
@@ -339,6 +355,95 @@ def generate_thumbnail(video_path: str, thumbnail_path: str) -> bool:
     return Path(thumbnail_path).exists()
 
 
+def generate_audio_derivatives(files: Dict[str, str]) -> Dict[str, object]:
+    """Erzeugt left/right (und optional mix) offline aus master.wav."""
+    video_path = files["video"]
+    master_wav = files["master_wav"]
+    left = files["left"]
+    right = files["right"]
+    mix = files["audio_mix"]
+
+    results: Dict[str, object] = {
+        "master": ensure_master_wav(video_path, master_wav),
+        "left": {"ok": False},
+        "right": {"ok": False},
+        "mix": {"ok": False, "skipped": not CREATE_AUDIO_MIX},
+    }
+
+    if not results["master"].get("ok", False):
+        return results
+
+    results["left"] = run_ffmpeg_task(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            master_wav,
+            "-filter:a",
+            "pan=mono|c0=c0",
+            "-c:a",
+            "pcm_s32le",
+            "-ar",
+            str(AUDIO_RATE),
+            "-ac",
+            "1",
+            left,
+        ],
+        "render_left",
+    )
+
+    results["right"] = run_ffmpeg_task(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            master_wav,
+            "-filter:a",
+            "pan=mono|c0=c1",
+            "-c:a",
+            "pcm_s32le",
+            "-ar",
+            str(AUDIO_RATE),
+            "-ac",
+            "1",
+            right,
+        ],
+        "render_right",
+    )
+
+    if CREATE_AUDIO_MIX:
+        mix_expr = "0.5*c0+0.5*c1"
+        results["mix"] = run_ffmpeg_task(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                master_wav,
+                "-filter:a",
+                f"pan=stereo|c0={mix_expr}|c1={mix_expr}",
+                "-c:a",
+                "pcm_s32le",
+                "-ar",
+                str(AUDIO_RATE),
+                "-ac",
+                "2",
+                mix,
+            ],
+            "render_mix",
+        )
+
+    return results
+
+
 def finalize_recording_locked(final_status: str, return_code: Optional[int], reason: str) -> Dict:
     """Schritt 10: Aufnahme finalisieren und metadata.json schreiben (unter Lock)."""
     global CURRENT_RECORDING, LAST_RECORDING, FFMPEG_PROCESS, FFMPEG_LOG_HANDLE
@@ -361,6 +466,8 @@ def finalize_recording_locked(final_status: str, return_code: Optional[int], rea
         CURRENT_RECORDING["files"]["thumbnail"],
     )
 
+    audio_derivation = generate_audio_derivatives(CURRENT_RECORDING["files"])
+
     started_dt = datetime.fromisoformat(CURRENT_RECORDING["started_at"])
     ended_dt = datetime.fromisoformat(ended_at)
     duration_seconds = max(0.0, (ended_dt - started_dt).total_seconds())
@@ -378,8 +485,11 @@ def finalize_recording_locked(final_status: str, return_code: Optional[int], rea
         "ffmpeg_pid": CURRENT_RECORDING["ffmpeg_pid"],
         "ffmpeg_return_code": return_code,
         "thumbnail_created": thumbnail_created,
+        "create_audio_mix": CREATE_AUDIO_MIX,
+        "audio_derivation": audio_derivation,
         "files": {
             "video": file_info(CURRENT_RECORDING["files"]["video"]),
+            "master_wav": file_info(CURRENT_RECORDING["files"]["master_wav"]),
             "audio_mix": file_info(CURRENT_RECORDING["files"]["audio_mix"]),
             "left": file_info(CURRENT_RECORDING["files"]["left"]),
             "right": file_info(CURRENT_RECORDING["files"]["right"]),
@@ -491,6 +601,7 @@ def start_recording():
         FFMPEG_PROCESS = process
         FFMPEG_LOG_HANDLE = ffmpeg_log_handle
 
+    # Kurzer Health-Check außerhalb des Locks, um Immediate-Fail früh zu erkennen.
     time.sleep(1.0)
 
     with STATE_LOCK:
@@ -534,11 +645,13 @@ def stop_recording():
 
         if process.poll() is None and process.stdin is not None:
             try:
+                # ffmpeg sauber stoppen: 'q' auf stdin
                 process.stdin.write("q\n")
                 process.stdin.flush()
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Graceful stop via stdin fehlgeschlagen: %s", exc)
 
+    # Warten außerhalb Lock, damit Status-Endpoint nicht komplett blockiert.
     try:
         process.wait(timeout=STOP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -594,4 +707,3 @@ def status():
 if __name__ == "__main__":
     LOGGER.info("Recorder-Server startet auf 0.0.0.0:5051")
     app.run(host="0.0.0.0", port=5051, debug=False, threaded=True)
-```
