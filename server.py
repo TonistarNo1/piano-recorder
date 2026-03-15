@@ -170,7 +170,10 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
 
     mix_expr = "0.5*c0+0.5*c1"
     filter_complex = (
-        "[1:a]asplit=4[a_mix_video_src][a_mix_wav_src][a_left_src][a_right_src];"
+        f"[1:a]aresample={AUDIO_RATE}:async={AUDIO_ASYNC_SAMPLES}:min_hard_comp=0.100:first_pts=0,"
+        f"aformat=sample_fmts=s32:sample_rates={AUDIO_RATE}:channel_layouts=stereo,"
+        "asetpts=N/SR/TB[a_clean];"
+        "[a_clean]asplit=4[a_mix_video_src][a_mix_wav_src][a_left_src][a_right_src];"
         f"[a_mix_video_src]pan=stereo|c0={mix_expr}|c1={mix_expr}[a_mix_video];"
         f"[a_mix_wav_src]pan=stereo|c0={mix_expr}|c1={mix_expr}[a_mix_wav];"
         "[a_left_src]pan=mono|c0=c0[a_left];"
@@ -185,6 +188,7 @@ def build_ffmpeg_command(recording_dir: Path) -> Tuple[list, Dict[str, str], str
         "-loglevel",
         "info",
         "-y",
+        "-fflags", "+genpts",
         "-f",
         "v4l2",
         "-thread_queue_size",
