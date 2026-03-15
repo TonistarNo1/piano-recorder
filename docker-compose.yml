@@ -26,7 +26,8 @@ services:
       VIDEO_THREAD_QUEUE_SIZE: "16384"
       AUDIO_THREAD_QUEUE_SIZE: "32768"
       VIDEO_RTBUF_SIZE: "512M"
-    
+
+      RECORD_MASTER_WAV_LIVE: "0"
       CREATE_AUDIO_MIX: "0"
     
       X264_PRESET: ultrafast
